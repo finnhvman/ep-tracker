@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
-const { PDFParse } = require('pdf-parse'); 
+// A pdfjs-dist node környezethez javasolt importja
+const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.mjs');
 
 const TARGETS = [
     {
@@ -22,6 +23,29 @@ const honapok = {
     'szeptember': '09', 'október': '10', 'november': '11', 'december': '12'
 };
 
+// Szöveg kinyerése pdfjs-dist segítségével
+async function getPdfText(buffer) {
+    const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buffer) }).promise;
+    let text = '';
+    
+    for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const content = await page.getTextContent();
+        
+        let lastY = -1;
+        for (const item of content.items) {
+            // Ha az Y koordináta érdemben változik, új sort kezdünk (fontos a DM miatt)
+            if (lastY !== -1 && Math.abs(item.transform[5] - lastY) > 5) {
+                text += '\n';
+            }
+            text += item.str + ' ';
+            lastY = item.transform[5];
+        }
+        text += '\n';
+    }
+    return text;
+}
+
 function extractValidDate(text) {
     const matchRossmann = text.match(/érvényes:\s*(\d{4})\.\s*([a-záéíóöőúüű]+)\s*(\d{1,2})/i);
     if (matchRossmann) {
@@ -31,7 +55,6 @@ function extractValidDate(text) {
         return `${ev}-${honap}-${nap}`;
     }
     
-    // DM dátum keresése: "ÉRVÉNYES: 2026.05.25-től"
     const matchDm = text.match(/(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})\./);
     if (matchDm) {
         return `${matchDm[1]}-${matchDm[2].padStart(2, '0')}-${matchDm[3].padStart(2, '0')}`;
@@ -40,7 +63,6 @@ function extractValidDate(text) {
     return new Date().toISOString().split('T')[0];
 }
 
-// Külön parser a Rossmannhoz (8-14 számjegyű EAN kódok)
 function extractRossmannProducts(text) {
     const products = new Map();
     const regex = /(\d{8,14})\s+([^\n]+)/g;
@@ -56,21 +78,18 @@ function extractRossmannProducts(text) {
     return products;
 }
 
-// Külön parser a DM-hez (7 számjegyű DAN kódok, elbaszott tördeléssel)
 function extractDmProducts(text) {
     const products = new Map();
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
     
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-        // Szigorúan 7 számjegyű azonosítót keresünk
         const match = line.match(/\b(\d{7})\b/);
         
         if (match) {
             const dan = match[1];
             let name = line.replace(dan, '').replace(/^"|"$/g, '').replace(/,/g, '').trim();
             
-            // Ha a sorban csak a szám volt (mert a PDF eltördelte), megnézzük az előző/következő sort
             if (name.length < 5) {
                 if (lines[i+1] && lines[i+1].length > 4 && !lines[i+1].match(/^\d+$/)) {
                     name = lines[i+1].replace(/^"|"$/g, '').trim();
@@ -103,10 +122,17 @@ async function processStore(target) {
     console.log(`[ ${target.id.toUpperCase()} ] FELDOLGOZÁSA`);
     console.log(`=========================================`);
     
-    const parser = new PDFParse({ url: target.url });
-    const result = await parser.getText(); 
-    const text = result.text;
+    let buffer;
+    try {
+        const response = await fetch(target.url);
+        if (!response.ok) throw new Error(`HTTP hiba: ${response.status}`);
+        buffer = Buffer.from(await response.arrayBuffer());
+    } catch (e) {
+        console.error(`Nem sikerült letölteni a PDF-et innen: ${target.url}`);
+        return;
+    }
     
+    const text = await getPdfText(buffer);
     const fileDate = extractValidDate(text);
     const newFileName = `${fileDate}_${target.id}_ep.pdf`;
     const newFilePath = path.join(DOWNLOAD_DIR, newFileName);
@@ -126,15 +152,10 @@ async function processStore(target) {
         fileToCompareNew = allPdfs[0];
         fileToCompareOld = allPdfs[1];
 
-        const parserNew = new PDFParse({ data: fs.readFileSync(fileToCompareNew) });
-        newProducts = extractProducts(target.id, (await parserNew.getText()).text);
-
-        const parserOld = new PDFParse({ data: fs.readFileSync(fileToCompareOld) });
-        oldProducts = extractProducts(target.id, (await parserOld.getText()).text);
+        newProducts = extractProducts(target.id, await getPdfText(fs.readFileSync(fileToCompareNew)));
+        oldProducts = extractProducts(target.id, await getPdfText(fs.readFileSync(fileToCompareOld)));
 
     } else {
-        const response = await fetch(target.url);
-        const buffer = Buffer.from(await response.arrayBuffer());
         fs.writeFileSync(newFilePath, buffer);
         console.log(`Új lista mentve: ${newFilePath}\n`);
 
@@ -148,9 +169,7 @@ async function processStore(target) {
         fileToCompareOld = allPdfs[1];
 
         newProducts = extractProducts(target.id, text); 
-        
-        const parserOld = new PDFParse({ data: fs.readFileSync(fileToCompareOld) });
-        oldProducts = extractProducts(target.id, (await parserOld.getText()).text);
+        oldProducts = extractProducts(target.id, await getPdfText(fs.readFileSync(fileToCompareOld)));
     }
 
     console.log(`Összehasonlítás:\nRégi: ${path.basename(fileToCompareOld)}\nÚj: ${path.basename(fileToCompareNew)}\n`);

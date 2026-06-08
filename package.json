@@ -10,6 +10,6 @@
     "test": "node compare.js"
   },
   "dependencies": {
-    "pdf-parse": "2.4.5"
+    "pdfjs-dist": "6.0.227"
   }
 }
